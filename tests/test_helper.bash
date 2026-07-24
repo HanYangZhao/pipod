@@ -7,6 +7,10 @@
 
 PIPOD="${PIPOD:-$(cd "${BATS_TEST_DIRNAME}/.." && pwd)/pipod}"
 export PIPOD
+# Force docker (the mocked runtime) so the mock shim takes effect even when
+# podman is installed on the host — the runtime detection would otherwise
+# find podman first and bypass the mock entirely.
+export CONTAINER_RUNTIME=docker
 
 # Source pipod so its functions are available in the test shell. pipod's
 # source-guard (BASH_SOURCE != $0) skips strict mode and the main flow.

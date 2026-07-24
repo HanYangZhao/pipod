@@ -68,7 +68,8 @@ case "$subcmd" in
         exit 0
         ;;
     top)
-        # Mimic `docker top <name> -o pid` header + $TOP_N data rows.
+        # Mimic `$CONTAINER_RUNTIME top <name> ps -o pid` header + $TOP_N data rows.
+        # (The `ps` arg is required for Podman compatibility; docker-mock ignores it.)
         printf 'PID\n'
         i=0
         while [ "$i" -lt "$TOP_N" ]; do

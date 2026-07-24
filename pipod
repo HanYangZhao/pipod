@@ -4,8 +4,8 @@ show_help() {
     cat <<'EOF'
 Usage: pipod [claude|codex|junie] [OPTIONS] [COMMAND] [-- ARGS...]
 
-Run the pi, Claude Code, Codex, or Junie agent inside an isolated Docker
-container. One persistent container is created per workspace directory, per
+Run the pi, Claude Code, Codex, or Junie agent inside an isolated podman or
+Docker container. One persistent container is created per workspace directory, per
 agent.
 
 Commands:
@@ -38,7 +38,7 @@ EOF
 
 # Scan the pipod config root (~/.pipod) for entries not owned by the
 # invoking user and chown them back. Docker creates bind-mount sources as
-# root when the host path is missing at `docker run`/`docker start` time, so a
+# root when the host path is missing at `$CONTAINER_RUNTIME run`/`$CONTAINER_RUNTIME start` time, so a
 # config tree that was deleted (or never created) can come back root-owned and
 # trigger EACCES for the in-container ubuntu user — both root-owned ancestors
 # (which would block the `mkdir -p` in prepare_config) and stale root-owned
@@ -69,16 +69,16 @@ recover_root_owned() {
 # only possible when no container is attached, hence the -r guidance.
 ensure_no_net_network() {
     local net="$1"
-    if docker network inspect "$net" >/dev/null 2>&1; then
-        [ "$(docker network inspect -f '{{.Internal}}' "$net")" = "true" ] && return
-        docker network rm "$net" >/dev/null 2>&1 || {
+    if $CONTAINER_RUNTIME network inspect "$net" >/dev/null 2>&1; then
+        [ "$($CONTAINER_RUNTIME network inspect -f '{{.Internal}}' "$net")" = "true" ] && return
+        $CONTAINER_RUNTIME network rm "$net" >/dev/null 2>&1 || {
             echo "pipod: '$net' exists with the wrong config and can't be removed (a container is still attached)." >&2
             echo "       Run './pipod -r -nn' to recreate the container first." >&2
             exit 1
         }
     fi
     echo "Creating no-Internet network $net"
-    docker network create --internal "$net" >/dev/null
+    $CONTAINER_RUNTIME network create --internal "$net" >/dev/null
 }
 
 # Copy essential config from the host's agent dir into $dst_dir when missing,
@@ -160,18 +160,18 @@ prepare_config() {
     for entry in "${DATA_MOUNTS[@]}"; do
         mkdir -p "$WS_AGENT_DIR/${entry%%|*}"
     done
-    for entry in "${DATA_FILE_MOUNTS[@]}"; do
+    for entry in "${DATA_FILE_MOUNTS[@]+"${DATA_FILE_MOUNTS[@]}"}"; do
         f="$WS_AGENT_DIR/${entry%%|*}"
         [ -f "$f" ] || : > "$f"
     done
     bootstrap_config "$SHARED_CONFIG_DIR"
     local d
-    for d in "${BOOTSTRAP_DIRS[@]}"; do
+    for d in "${BOOTSTRAP_DIRS[@]+"${BOOTSTRAP_DIRS[@]}"}"; do
         bootstrap_config_dir "$SHARED_CONFIG_DIR" "$d"
     done
     if [ -d "$OVERRIDE_SRC" ]; then
         bootstrap_config "$OVERRIDE_SRC"
-        for d in "${BOOTSTRAP_DIRS[@]}"; do
+        for d in "${BOOTSTRAP_DIRS[@]+"${BOOTSTRAP_DIRS[@]}"}"; do
             bootstrap_config_dir "$OVERRIDE_SRC" "$d"
         done
     fi
@@ -333,10 +333,14 @@ fi
 
 parse_args "$@"
 
-if ! command -v docker &>/dev/null; then
-    echo "pipod: Docker is not installed (or not on PATH). Please install Docker and try again." >&2
+# Container runtime: podman first (if available), then docker; override with CONTAINER_RUNTIME env var.
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-$(command -v podman 2>/dev/null || command -v docker 2>/dev/null || true)}"
+if [ -z "$CONTAINER_RUNTIME" ]; then
+    echo "pipod: Neither podman nor docker is installed. Please install one and try again." >&2
     exit 1
 fi
+# command -v returns a full path; basename for string comparisons below.
+RT_BASENAME="$(basename "$CONTAINER_RUNTIME")"
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_DIR="$(pwd)"
@@ -391,17 +395,18 @@ CONTAINER_NAME="$CONTAINER_PREFIX-$WS_SLUG"
 # Shared `--internal` Docker network used by `--no-network`: it blocks all
 # egress to the Internet. The host stays reachable because host.docker.internal
 # is pointed at this network's on-link gateway (NOT `host-gateway`, which
+# resolves to docker0/docker_host and would be off-subnet/unreachable here).
 # resolves to docker0 and would be off-subnet/unreachable here).
 NO_NET_NETWORK="pipod-no-net"
 
 # `stop` short-circuits before any build/create/recreate work: it kills the
 # workspace/agent container in place.
 if [ "$STOP_MODE" = true ]; then
-    STATUS=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "missing")
+    STATUS=$($CONTAINER_RUNTIME inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "missing")
     case "$STATUS" in
         running|paused|created)
             echo "Stopping $CONTAINER_NAME"
-            docker kill "$CONTAINER_NAME" >/dev/null 2>&1 || true
+            $CONTAINER_RUNTIME kill "$CONTAINER_NAME" >/dev/null 2>&1 || true
             ;;
         exited|dead)
             echo "$CONTAINER_NAME is not running"
@@ -415,9 +420,9 @@ if [ "$STOP_MODE" = true ]; then
 fi
 
 # Remove existing container if -r.
-EXISTING=$(docker ps -aq -f name=^${CONTAINER_NAME}$)
+EXISTING=$($CONTAINER_RUNTIME ps -aq -f name=^${CONTAINER_NAME}$)
 if [ -n "$EXISTING" ] && [ "$RECREATE" = true ]; then
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    $CONTAINER_RUNTIME rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     EXISTING=""
 fi
 
@@ -430,7 +435,7 @@ confirm_recreate() {
     read -r -p "Recreate $CONTAINER_NAME? (Y/n) " _answer || _answer=""
     if [[ ! "$_answer" =~ ^[Nn] ]]; then
         echo "Recreating $CONTAINER_NAME"
-        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        $CONTAINER_RUNTIME rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
         EXISTING=""
     else
         echo "Keeping $CONTAINER_NAME; the new config will not take effect this run (use ./pipod -r to force)."
@@ -454,7 +459,7 @@ if [ -n "$EXISTING" ]; then
             printf '%s -> %s\n' "$CONFIG_MOUNT_SRC" "$CONFIG_MOUNT_DEST"
             [ -d "$OVERRIDE_SRC" ] && printf '%s -> %s\n' "$OVERRIDE_SRC" "$OVERRIDE_DEST"
         fi
-        for entry in "${DATA_MOUNTS[@]}" "${DATA_FILE_MOUNTS[@]}"; do
+        for entry in "${DATA_MOUNTS[@]}" "${DATA_FILE_MOUNTS[@]+"${DATA_FILE_MOUNTS[@]}"}"; do
             printf '%s -> %s\n' "$WS_AGENT_DIR/${entry%%|*}" "${entry#*|}"
         done
         true
@@ -462,7 +467,7 @@ if [ -n "$EXISTING" ]; then
     # Escape CONFIG_ROOT for use as a literal in the grep ERE (dots only; the
     # mount destination lives under it, plus the /workspace mount).
     config_root_ere="$(printf '%s' "$CONFIG_ROOT" | sed 's/\./\\./g')"
-    actual=$( docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep -E " -> (/workspace|${config_root_ere})(/|\$)" | sort -u || true )
+    actual=$( $CONTAINER_RUNTIME inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep -E " -> (/workspace|${config_root_ere})(/|\$)" | sort -u || true )
     if [ -n "$actual" ] && [ "$expected" != "$actual" ]; then
         missing=$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
         extra=$(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
@@ -481,7 +486,7 @@ prepare_config
 if [ -z "$EXISTING" ]; then
     # No existing container — build the image and create one.
     echo "Building a new container $CONTAINER_NAME"
-    docker build \
+    $CONTAINER_RUNTIME build \
         $NO_CACHE \
         --build-arg HOST_UID="$(id -u)" \
         --build-arg HOST_GID="$(id -g)" \
@@ -500,31 +505,34 @@ if [ -z "$EXISTING" ]; then
             VOLUMES+=(-v "$OVERRIDE_SRC:$OVERRIDE_DEST")
         fi
     fi
-    for entry in "${DATA_MOUNTS[@]}" "${DATA_FILE_MOUNTS[@]}"; do
+    for entry in "${DATA_MOUNTS[@]}" "${DATA_FILE_MOUNTS[@]+"${DATA_FILE_MOUNTS[@]}"}"; do
         VOLUMES+=(-v "$WS_AGENT_DIR/${entry%%|*}:${entry#*|}")
     done
 
     # --no-network: attach to the shared --internal network (egress blocked)
     # and point host.docker.internal at that network's on-link gateway so the
-    # host stays reachable. `host-gateway` resolves to docker0, which is
-    # off-subnet for an internal network and would be dropped, so the gateway
-    # IP is used directly. Otherwise the default bridge + host-gateway is used.
+    # host stays reachable. Podman's embedded DNS resolves host.docker.internal
+    # at runtime on the default network, so no --add-host needed there. For
+    # internal networks DNS doesn't work, so we use the gateway IP directly.
+    # Docker needs --add-host with host-gateway (default) or gateway IP (internal).
     NETWORK_OPT=""
-    ADD_HOST=(--add-host=host.docker.internal:host-gateway)
+    ADD_HOST=()
     if [ "$NO_NETWORK" = true ]; then
         ensure_no_net_network "$NO_NET_NETWORK"
-        gw="$(docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "$NO_NET_NETWORK" 2>/dev/null)"
+        gw="$($CONTAINER_RUNTIME network inspect -f '{{range .Subnets}}{{.Gateway}}{{end}}' "$NO_NET_NETWORK" 2>/dev/null)"
+        # Internal network — DNS resolver won't work, need explicit --add-host.
+        # Podman can't use host-gateway on internal networks; use gateway IP.
+        ADD_HOST=(--add-host=host.docker.internal:"${gw:-127.0.0.1}")
         NETWORK_OPT="--network=$NO_NET_NETWORK"
-        ADD_HOST=(--add-host=host.docker.internal:"${gw:-host-gateway}")
     fi
 
     echo "Starting container $CONTAINER_NAME"
-    docker run -d \
+    $CONTAINER_RUNTIME run -d \
         --name "$CONTAINER_NAME" \
         --entrypoint sleep \
-        "${ADD_HOST[@]}" \
+        "${ADD_HOST[@]+"${ADD_HOST[@]}"}" \
         $NETWORK_OPT \
-        "${AGENT_ENV[@]}" \
+        "${AGENT_ENV[@]+"${AGENT_ENV[@]}"}" \
         "${VOLUMES[@]}" \
         -w /workspace \
         "$IMAGE_TAG" \
@@ -533,11 +541,11 @@ else
     # Existing container — bring it to a usable state.
     WAITED=0
     while true; do
-        STATUS=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "missing")
+        STATUS=$($CONTAINER_RUNTIME inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "missing")
         case "$STATUS" in
             running)
                 # If only the idle sleep process remains, a stop may be in progress.
-                if [ "$(docker top "$CONTAINER_NAME" -o pid 2>/dev/null | tail -n +2 | wc -l)" -le 1 ] && [ "$WAITED" -lt 15 ]; then
+                if [ "$($CONTAINER_RUNTIME top "$CONTAINER_NAME" ps -o pid 2>/dev/null | tail -n +2 | wc -l)" -le 1 ] && [ "$WAITED" -lt 15 ]; then
                     [[ "$WAITED" -eq 0 ]] && echo "Waiting for $CONTAINER_NAME to finish stopping"
                     sleep 1; WAITED=$((WAITED + 1)); continue
                 fi
@@ -545,12 +553,12 @@ else
                 ;;
             exited|dead|created)
                 echo "Starting container $CONTAINER_NAME"
-                docker start "$CONTAINER_NAME" >/dev/null
+                $CONTAINER_RUNTIME start "$CONTAINER_NAME" >/dev/null
                 break
                 ;;
             paused)
                 echo "Unpausing container $CONTAINER_NAME"
-                docker unpause "$CONTAINER_NAME" >/dev/null
+                $CONTAINER_RUNTIME unpause "$CONTAINER_NAME" >/dev/null
                 break
                 ;;
             *)
@@ -563,7 +571,7 @@ fi
 
 # Probe real outbound connectivity and host reachability for --no-network.
 probe_internet() {
-    docker exec "$CONTAINER_NAME" node -e '
+    $CONTAINER_RUNTIME exec "$CONTAINER_NAME" node -e '
       const s = require("net").connect(443, "1.1.1.1");
       s.setTimeout(2000);
       s.on("connect",  () => process.exit(0));
@@ -573,7 +581,7 @@ probe_internet() {
 }
 # REFUSED on a closed port means the host stack answered (reachable); timeout means unreachable.
 probe_host() {
-    docker exec "$CONTAINER_NAME" node -e '
+    $CONTAINER_RUNTIME exec "$CONTAINER_NAME" node -e '
       const s = require("net").connect(9, "host.docker.internal");
       s.setTimeout(2000);
       s.on("connect",  () => process.exit(0));
@@ -587,11 +595,11 @@ if [ "$NO_NETWORK" = true ]; then
     if probe_internet; then
         echo "pipod: --no-network is set but $CONTAINER_NAME can still reach the Internet." >&2
         echo "pipod: egress isn't blocked — recreate the network with:" >&2
-        echo "         docker network rm $NO_NET_NETWORK && ./pipod -r -nn" >&2
+        echo "         $CONTAINER_RUNTIME network rm $NO_NET_NETWORK && ./pipod -r -nn" >&2
     elif ! probe_host; then
         echo "pipod: --no-network is set but $CONTAINER_NAME can't reach the host (host.docker.internal)." >&2
         echo "pipod: the host should still be reachable — recreate the network with:" >&2
-        echo "         docker network rm $NO_NET_NETWORK && ./pipod -r -nn" >&2
+        echo "         $CONTAINER_RUNTIME network rm $NO_NET_NETWORK && ./pipod -r -nn" >&2
     else
         echo "Network: isolated ($NO_NET_NETWORK) — host reachable, no Internet."
     fi
@@ -604,14 +612,14 @@ EXEC_FLAGS=(-it)
 [ "$NO_TTY" = true ] && EXEC_FLAGS=(-i)
 if [ "$SHELL_MODE" = true ]; then
     echo "Opening bash shell inside $CONTAINER_NAME container"
-    docker exec "${EXEC_FLAGS[@]}" "$CONTAINER_NAME" bash "${EXTRA_ARGS[@]}"
+    $CONTAINER_RUNTIME exec "${EXEC_FLAGS[@]}" "$CONTAINER_NAME" bash "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 else
     echo "Starting a new $AGENT_LABEL session inside $CONTAINER_NAME container"
-    docker exec "${EXEC_FLAGS[@]}" "$CONTAINER_NAME" "${RUN_CMD[@]}" "${EXTRA_ARGS[@]}"
+    $CONTAINER_RUNTIME exec "${EXEC_FLAGS[@]}" "$CONTAINER_NAME" "${RUN_CMD[@]}" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 fi
 
 # Auto-stop container when only the sleep idle process remains.
-if [ "$(docker top "$CONTAINER_NAME" -o pid 2>/dev/null | tail -n +2 | wc -l)" -le 1 ]; then
+if [ "$($CONTAINER_RUNTIME top "$CONTAINER_NAME" ps -o pid 2>/dev/null | tail -n +2 | wc -l)" -le 1 ]; then
     echo "Stopping $CONTAINER_NAME"
-    docker kill "$CONTAINER_NAME" >/dev/null 2>&1 &
+    $CONTAINER_RUNTIME kill "$CONTAINER_NAME" >/dev/null 2>&1 &
 fi

@@ -12,7 +12,7 @@ RUN apt-get update && \
 RUN npm install -g @anthropic-ai/claude-code
 # Map the ubuntu user (UID/GID 1000) to the host's UID/GID
 RUN if [ -n "${HOST_GID}" ] && [ "${HOST_GID}" != "1000" ]; then \
-      groupmod -g "${HOST_GID}" ubuntu; \
+      groupmod -g "${HOST_GID}" ubuntu || echo "WARNING: groupmod -g ${HOST_GID} failed (GID already in use), keeping original group" >&2; \
     fi && \
     if [ -n "${HOST_UID}" ] && [ "${HOST_UID}" != "1000" ]; then \
       usermod -u "${HOST_UID}" ubuntu; \
